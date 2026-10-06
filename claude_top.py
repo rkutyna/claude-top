@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """claude-top: per-session CPU / GPU / memory for Claude Code and everything it spawned.
 
-Stdlib only, no root needed. Runs on macOS (ps, ioreg, libproc) and Linux (/proc,
-nvidia-smi for GPU).
+Stdlib only, no root needed. Runs on macOS (ps, ioreg, libproc) and Linux (/proc;
+GPU from DRM fdinfo for AMD/Intel and nvidia-smi for NVIDIA).
 
   claude_top.py            live dashboard
   claude_top.py --once     print one snapshot and exit
@@ -161,6 +161,8 @@ def read_procs_macos():
 class MacGpu:
     """Per-process GPU time from the IOKit registry (Apple Silicon)."""
 
+    available = True
+
     def __init__(self):
         self.prev = {}  # registry id -> accumulated GPU ns
 
@@ -208,6 +210,7 @@ class NvidiaGpu:
 
     def __init__(self):
         self.smi = shutil.which("nvidia-smi")
+        self.available = bool(self.smi)
 
     def sample(self, dt):
         if not self.smi:
@@ -229,6 +232,100 @@ class NvidiaGpu:
             except ValueError:
                 pass
         return by_pid, (sum(utils) / len(utils) if utils else None)
+
+
+class DrmGpu:
+    """Per-process GPU time from DRM fdinfo (amdgpu, i915; Linux 5.19+).
+
+    Every open handle on a GPU shows up as /proc/<pid>/fdinfo/<fd> with
+    cumulative "drm-engine-<name>: <n> ns" counters, readable for your own
+    processes without root.
+    """
+
+    DRIVERS = ("amdgpu", "i915")
+
+    def __init__(self):
+        self.prev = {}  # (device, client id) -> accumulated engine ns
+        self.cards = [c for c in glob.glob("/sys/class/drm/card[0-9]*")
+                      if re.search(r"card\d+$", c)]
+        drivers = [os.path.basename(os.path.realpath(c + "/device/driver")) for c in self.cards]
+        self.available = any(d in self.DRIVERS for d in drivers)
+
+    def _clients(self):
+        clients = {}  # (device, client id) -> (pid, ns)
+        for name in sorted((n for n in os.listdir("/proc") if n.isdigit()), key=int):
+            fd_dir = "/proc/%s/fd" % name
+            try:
+                fds = os.listdir(fd_dir)
+            except OSError:
+                continue  # not ours, or gone
+            for fd in fds:
+                try:
+                    if not os.readlink("%s/%s" % (fd_dir, fd)).startswith("/dev/dri/"):
+                        continue
+                    with open("/proc/%s/fdinfo/%s" % (name, fd)) as fh:
+                        text = fh.read()
+                except OSError:
+                    continue
+                cid = dev = None
+                ns = 0
+                for line in text.splitlines():
+                    key, _, val = line.partition(":")
+                    val = val.split()
+                    if not val:
+                        continue
+                    if key == "drm-client-id":
+                        cid = val[0]
+                    elif key == "drm-pdev":
+                        dev = val[0]
+                    elif key.startswith("drm-engine-") and val[-1] == "ns" and val[0].isdigit():
+                        ns += int(val[0])
+                # one client is often open on several fds, and inherited across
+                # fork; count it once, for the newest process holding it
+                if cid is not None:
+                    clients[(dev, cid)] = (int(name), ns)
+        return clients
+
+    def _system(self):
+        utils = []
+        for card in self.cards:
+            try:
+                with open(card + "/device/gpu_busy_percent") as fh:  # amdgpu only
+                    utils.append(float(fh.read().strip()))
+            except (OSError, ValueError):
+                pass
+        return max(utils) if utils else None
+
+    def sample(self, dt):
+        if not self.available:
+            return {}, None
+        clients = self._clients()
+        by_pid = {}
+        if dt and dt > 0:
+            for key, (pid, ns) in clients.items():
+                delta = ns - self.prev.get(key, ns)
+                if delta > 0:
+                    by_pid[pid] = by_pid.get(pid, 0.0) + delta / 1e9 / dt * 100
+        self.prev = {key: ns for key, (pid, ns) in clients.items()}
+        return by_pid, self._system()
+
+
+class LinuxGpu:
+    """NVIDIA and DRM backends together, for machines with both."""
+
+    def __init__(self):
+        self.backends = [b for b in (NvidiaGpu(), DrmGpu()) if b.available]
+        self.available = bool(self.backends)
+
+    def sample(self, dt):
+        by_pid, system = {}, []
+        for b in self.backends:
+            pids, util = b.sample(dt)
+            for pid, pct in pids.items():
+                by_pid[pid] = by_pid.get(pid, 0.0) + pct
+            if util is not None:
+                system.append(util)
+        return by_pid, (max(system) if system else None)
 
 
 def pretty_cmd(p):
@@ -278,7 +375,7 @@ class Sampler:
                 self.ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         except (ValueError, OSError):
             self.ram = 0
-        self.gpu = MacGpu() if MACOS else NvidiaGpu()
+        self.gpu = MacGpu() if MACOS else LinuxGpu()
         self.prev_cpu = {}      # proc key -> cputime
         self.prev_t = None
         self.sessions = {}      # sid -> Session (kept after exit while orphans live)
@@ -423,8 +520,7 @@ def render(sampler, sessions, sort="cpu", expanded=True, width=120, interval=2.0
         return A_BOLD
 
     gpu_sys = "n/a" if sampler.sys_gpu is None else "%.0f%%" % sampler.sys_gpu
-    has_gpu = MACOS or sampler.sys_gpu is not None
-    fmt_gpu = (lambda v: "%.1f" % v) if has_gpu else (lambda v: "-")
+    fmt_gpu = (lambda v: "%.1f" % v) if sampler.gpu.available else (lambda v: "-")
     lines = [
         ("claude-top   system: CPU %.0f%% of %d%% (%d cores, 100%% = 1 core)   GPU %s   RAM %s"
          % (sampler.sys_cpu, ncpu * 100, ncpu, gpu_sys, fmt_mem(sampler.ram)), A_BOLD),

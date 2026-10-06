@@ -51,7 +51,8 @@ session, `+` / `-` change the refresh interval, `q` quits.
   red above half of all cores.
 - **MEM** is physical footprint on macOS (the figure Activity Monitor shows) and PSS on Linux, so
   summing across processes does not double-count shared memory.
-- **GPU%** is the share of GPU time used by the session's processes.
+- **GPU%** is the share of GPU time used by the session's processes. A `-` means no supported
+  GPU was found.
 - Each session's total includes the `claude` process itself, which is listed separately so the
   things it launched stand out.
 - A session whose `claude` process has exited but whose processes are still running stays
@@ -72,11 +73,19 @@ by PID and process group, so they stay attributed to the session that started th
 |---|---|---|
 | macOS, Apple Silicon | yes | yes, per process (Metal clients, via `ioreg`) |
 | macOS, Intel | yes | not expected to work |
-| Linux | yes (`/proc`) | NVIDIA only, via `nvidia-smi pmon` |
+| Linux, AMD (`amdgpu`) | yes (`/proc`) | yes, per process (DRM fdinfo, kernel 5.19+) |
+| Linux, Intel (`i915`) | yes | same mechanism as AMD; untested, no system-wide figure |
+| Linux, Intel (`xe`) | yes | not yet |
+| Linux, NVIDIA | yes | via `nvidia-smi pmon`; untested |
 
-Tested on macOS with real Claude Code sessions. The Linux backend has been tested against a
-simulated session, not a real Claude Code install, and the NVIDIA path has not been run on real
-hardware — reports welcome.
+What has actually been run:
+
+- macOS on Apple Silicon, with real Claude Code sessions.
+- Linux CPU / memory, against a simulated session rather than a real Claude Code install.
+- Linux AMD GPU, on a Radeon R9 390 under a full synthetic load: `claude-top` reported 97.8%
+  against the driver's own 100% busy figure.
+
+The Intel and NVIDIA paths have not been run on real hardware — reports welcome.
 
 ## Limitations
 
